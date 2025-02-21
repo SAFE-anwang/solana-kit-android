@@ -1,5 +1,6 @@
 package io.horizontalsystems.solanakit.noderpc
 
+import android.util.Log
 import com.solana.api.Api
 import com.solana.rxsolana.api.getBlockHeight
 import io.horizontalsystems.solanakit.SolanaKit
@@ -79,6 +80,7 @@ class ApiSyncer(
             val blockHeight = api.getBlockHeight().await()
             handleBlockHeight(blockHeight)
         } catch (error: Throwable) {
+            Log.e("PendingTransactionSyncer", "sync error=$error")
             state = SyncerState.NotReady(error)
         }
     }

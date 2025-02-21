@@ -14,7 +14,7 @@ interface TransactionsDao {
     @Query("SELECT * FROM `Transaction` WHERE NOT pending ORDER BY timestamp DESC LIMIT 1")
     fun lastNonPendingTransaction() : Transaction?
 
-    @Query("SELECT * FROM `Transaction` WHERE pending ORDER BY timestamp")
+    @Query("SELECT * FROM `Transaction` WHERE true ORDER BY timestamp")
     fun pendingTransactions() : List<Transaction>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
