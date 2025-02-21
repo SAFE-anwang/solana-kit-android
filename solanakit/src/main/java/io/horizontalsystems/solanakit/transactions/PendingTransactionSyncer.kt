@@ -50,8 +50,6 @@ class PendingTransactionSyncer(
                     val params: MutableList<Any> = ArrayList()
                     params.add(pendingTx.hash)
                     rpcClient.router.request<ConfirmedTransaction>("getTransaction", params, ConfirmedTransaction::class.java) {
-                        Log.e("longwen", "isSuccess=${it.isSuccess}")
-                        Log.e("longwen", "result=${it.getOrNull()}")
                         if (it.isSuccess) {
                             it.getOrNull()?.meta?.let { meta ->
                                 updatedTransactions.add(
