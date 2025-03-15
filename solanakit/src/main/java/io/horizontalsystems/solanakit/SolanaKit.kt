@@ -43,6 +43,7 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import java.math.BigDecimal
 import java.util.Objects
+import javax.net.ssl.HostnameVerifier
 
 class SolanaKit(
     private val apiSyncer: ApiSyncer,
@@ -295,7 +296,9 @@ class SolanaKit(
 
         private fun httpClient(debug: Boolean): OkHttpClient {
             val client = OkHttpClient.Builder()
-
+                .hostnameVerifier(HostnameVerifier { hostname, session ->
+                    return@HostnameVerifier true
+                })
             if (debug) {
                 val loggingInterceptor = HttpLoggingInterceptor { message ->
                     Log.e("solana-kit", message)
