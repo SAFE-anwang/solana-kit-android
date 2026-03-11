@@ -7,7 +7,6 @@ import com.metaplex.lib.programs.token_metadata.accounts.MetadataAccountJsonAdap
 import com.metaplex.lib.programs.token_metadata.accounts.MetadataAccountRule
 import com.solana.actions.Action
 import com.solana.api.Api
-import com.solana.networking.Network
 import com.solana.networking.NetworkingRouterConfig
 import com.solana.networking.OkHttpNetworkingRouter
 import io.horizontalsystems.solanakit.core.BalanceManager
@@ -15,19 +14,21 @@ import io.horizontalsystems.solanakit.core.ISyncListener
 import io.horizontalsystems.solanakit.core.SolanaDatabaseManager
 import io.horizontalsystems.solanakit.core.SyncManager
 import io.horizontalsystems.solanakit.core.TokenAccountManager
+import io.horizontalsystems.solanakit.core.TokenProvider
 import io.horizontalsystems.solanakit.database.main.MainStorage
 import io.horizontalsystems.solanakit.database.transaction.TransactionStorage
 import io.horizontalsystems.solanakit.models.Address
 import io.horizontalsystems.solanakit.models.BufferInfoJsonAdapterFactory
 import io.horizontalsystems.solanakit.models.FullTokenAccount
 import io.horizontalsystems.solanakit.models.FullTransaction
+import io.horizontalsystems.solanakit.models.TokenInfo
 import io.horizontalsystems.solanakit.models.RpcSource
+import io.horizontalsystems.solanakit.models.Transaction
 import io.horizontalsystems.solanakit.network.ConnectionManager
 import io.horizontalsystems.solanakit.noderpc.ApiSyncer
 import io.horizontalsystems.solanakit.noderpc.NftClient
+import io.horizontalsystems.solanakit.transactions.JupiterApiService
 import io.horizontalsystems.solanakit.transactions.PendingTransactionSyncer
-import io.horizontalsystems.solanakit.transactions.SolanaFmService
-import io.horizontalsystems.solanakit.transactions.SolscanClient
 import io.horizontalsystems.solanakit.transactions.TransactionManager
 import io.horizontalsystems.solanakit.transactions.TransactionSyncer
 import kotlinx.coroutines.CoroutineScope
@@ -41,7 +42,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import org.sol4k.Base58
+import org.sol4k.Connection
+import org.sol4k.RpcUrl
+import org.sol4k.VersionedTransaction
+import org.sol4k.api.Commitment
 import java.math.BigDecimal
+import java.time.Instant
+import java.util.Base64
 import java.util.Objects
 import javax.net.ssl.HostnameVerifier
 
@@ -64,7 +72,7 @@ class SolanaKit(
     private val _lastBlockHeightFlow = MutableStateFlow(lastBlockHeight)
     private val _balanceFlow = MutableStateFlow(balance)
 
-    val isMainnet: Boolean = rpcSource.endpoint.network == Network.mainnetBeta
+    val isMainnet: Boolean = rpcSource.endpoint.network.name == "mainnet-beta"
     val receiveAddress = address.publicKey.toBase58()
 
     val lastBlockHeight: Long?
@@ -114,6 +122,14 @@ class SolanaKit(
     fun stop() {
         syncManager.stop()
         scope?.cancel()
+    }
+
+    fun pause() {
+        syncManager.pause()
+    }
+
+    fun resume() {
+        syncManager.resume()
     }
 
     fun refresh() {
@@ -191,6 +207,42 @@ class SolanaKit(
     fun nonFungibleTokenAccounts(): List<FullTokenAccount> =
         tokenAccountManager.tokenAccounts().filter { it.mintAccount.isNft }
 
+    fun estimateFee(hexEncoded: ByteArray): BigDecimal {
+        val base64Encoded = Base64.getEncoder().encodeToString(hexEncoded)
+        val versionedTx = VersionedTransaction.from(base64Encoded)
+        return versionedTx.calculateFee(baseFeeLamports)
+    }
+
+    fun sendRawTransaction(hexEncoded: ByteArray, signer: Signer): FullTransaction {
+        val base64Encoded = Base64.getEncoder().encodeToString(hexEncoded)
+        val versionedTx = VersionedTransaction.from(base64Encoded)
+        val signature = Base58.encode(signer.account.sign(versionedTx.message.serialize()))
+        versionedTx.addSignature(signature)
+        val base64WithSignature = Base64.getEncoder().encodeToString(versionedTx.serialize())
+
+        val connection = Connection(RpcUrl.MAINNNET)
+        val blockHash = connection.getLatestBlockhashExtended(Commitment.FINALIZED)
+
+        val transactionHash = connection.sendTransaction(versionedTx)
+
+        val fullTransaction = FullTransaction(
+            transaction = Transaction(
+                hash = transactionHash,
+                timestamp = Instant.now().epochSecond,
+                fee = versionedTx.calculateFee(baseFeeLamports),
+                from = address.publicKey.toBase58(),
+                to = null,
+                amount = null,
+                pending = true,
+                lastValidBlockHeight = blockHash.lastValidBlockHeight,
+                base64Encoded = base64WithSignature
+            ),
+            listOf()
+        )
+
+        return fullTransaction
+    }
+
     sealed class SyncState {
         class Synced : SyncState()
         class NotSynced(val error: Throwable) : SyncState()
@@ -231,6 +283,7 @@ class SolanaKit(
 
     companion object {
 
+        val baseFeeLamports = 5000
         val fee = BigDecimal(0.000155)
 
         // Solana network will not store a SOL account with less than ~0.001 SOL.
@@ -243,7 +296,6 @@ class SolanaKit(
             addressString: String,
             rpcSource: RpcSource,
             walletId: String,
-            solscanApiKey: String,
             debug: Boolean = false
         ): SolanaKit {
             val httpClient = httpClient(debug)
@@ -268,14 +320,13 @@ class SolanaKit(
 
             val transactionDatabase = SolanaDatabaseManager.getTransactionDatabase(application, walletId)
             val transactionStorage = TransactionStorage(transactionDatabase, addressString)
-            val solscanClient = SolscanClient(solscanApiKey, debug)
-            val tokenAccountManager = TokenAccountManager(addressString, rpcApiClient, transactionStorage, mainStorage, SolanaFmService())
+            val tokenAccountManager = TokenAccountManager(addressString, rpcApiClient, transactionStorage, mainStorage)
             val transactionManager = TransactionManager(address, transactionStorage, rpcAction, tokenAccountManager)
             val pendingTransactionSyncer = PendingTransactionSyncer(rpcApiClient, transactionStorage, transactionManager)
             val transactionSyncer = TransactionSyncer(
                 address.publicKey,
                 rpcApiClient,
-                solscanClient,
+                httpClient,
                 nftClient,
                 transactionStorage,
                 transactionManager,
@@ -283,6 +334,7 @@ class SolanaKit(
             )
 
             val syncManager = SyncManager(apiSyncer, balanceManager, tokenAccountManager, transactionSyncer, transactionManager)
+
 
             val kit = SolanaKit(apiSyncer, balanceManager, tokenAccountManager, transactionManager, syncManager, rpcSource, address)
             syncManager.listener = kit

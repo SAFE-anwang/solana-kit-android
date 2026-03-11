@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.rx2.await
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
 
@@ -35,6 +36,7 @@ class ApiSyncer(
 
     private var scope: CoroutineScope? = null
     private var isStarted = false
+    private var isPaused = false
     private var timerJob: Job? = null
 
     init {
@@ -68,6 +70,7 @@ class ApiSyncer(
 
     fun stop() {
         isStarted = false
+        isPaused = false
 
         connectionManager.stop()
         state = SyncerState.NotReady(SolanaKit.SyncError.NotStarted())
@@ -75,10 +78,25 @@ class ApiSyncer(
         stopTimer()
     }
 
+    fun pause() {
+        isPaused = true
+        stopTimer()
+    }
+
+    fun resume() {
+        isPaused = false
+
+        if (isStarted && connectionManager.isConnected) {
+            startTimer()
+        }
+    }
+
     private suspend fun sync() {
         try {
             val blockHeight = api.getBlockHeight().await()
             handleBlockHeight(blockHeight)
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Throwable) {
             Log.e("PendingTransactionSyncer", "sync error=$error")
             state = SyncerState.NotReady(error)
@@ -99,7 +117,9 @@ class ApiSyncer(
 
         if (connectionManager.isConnected) {
             state = SyncerState.Ready
-            startTimer()
+            if (!isPaused) {
+                startTimer()
+            }
         } else {
             state = SyncerState.NotReady(SolanaKit.SyncError.NoNetworkConnection())
             stopTimer()
@@ -107,6 +127,7 @@ class ApiSyncer(
     }
 
     private fun startTimer() {
+        timerJob?.cancel()
         timerJob = scope?.launch {
             flow {
                 while (isActive) {
