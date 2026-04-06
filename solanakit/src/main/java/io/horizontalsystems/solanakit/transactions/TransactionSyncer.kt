@@ -1,5 +1,6 @@
 package io.horizontalsystems.solanakit.transactions
 
+import android.util.Log
 import com.metaplex.lib.programs.token_metadata.TokenMetadataProgram
 import com.metaplex.lib.programs.token_metadata.accounts.MetadataAccount
 import com.metaplex.lib.programs.token_metadata.accounts.MetaplexTokenStandard.FungibleAsset
@@ -32,6 +33,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
+import org.json.JSONObject
 import java.math.BigDecimal
 import java.net.URL
 import kotlin.coroutines.resume
@@ -154,10 +156,46 @@ class TransactionSyncer(
 
         val response = httpClient.newCall(request).execute()
         response.use { resp ->
-            if (!resp.isSuccessful) return@withContext emptyMap()
+            if (!resp.isSuccessful) {
+                return@withContext executeIndividualRequests(signatures, rpcUrl)
+            }
             val body = resp.body?.string() ?: return@withContext emptyMap()
             parseBatchResponse(signatures, body)
         }
+    }
+
+    private suspend fun executeIndividualRequests(
+        signatures: List<String>,
+        rpcUrl: URL
+    ): Map<String, TransactionResponse> = withContext(Dispatchers.IO) {
+        val results = mutableMapOf<String, TransactionResponse>()
+        val adapter = moshi.adapter(TransactionResponse::class.java)
+
+        for (signature in signatures) {
+            try {
+                val body = """{"jsonrpc":"2.0","id":0,"method":"getTransaction","params":["$signature",{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}"""
+                val request = Request.Builder()
+                    .url(rpcUrl)
+                    .post(body.toRequestBody("application/json".toMediaType()))
+                    .build()
+
+                val response = httpClient.newCall(request).execute()
+                response.use { resp ->
+                    if (!resp.isSuccessful) {
+                        return@use
+                    }
+                    val responseBody = resp.body?.string() ?: return@use
+                    val json = JSONObject(responseBody)
+                    if (json.isNull("result")) return@use
+                    val txResponse = adapter.fromJson(json.getJSONObject("result").toString()) ?: return@use
+                    results[signature] = txResponse
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "Failed to fetch transaction $signature", e)
+            }
+        }
+
+        results
     }
 
     private fun parseBatchResponse(
@@ -179,6 +217,7 @@ class TransactionSyncer(
                 val txResponse = adapter.fromJson(resultObj.toString()) ?: continue
                 results[signatures[id]] = txResponse
             } catch (e: Throwable) {
+                Log.e(TAG, "Failed to parse batch response item $i", e)
                 continue
             }
         }
@@ -224,6 +263,8 @@ class TransactionSyncer(
         val tokenTransfers = mutableListOf<FullTokenTransfer>()
         val mintAddresses = mutableSetOf<String>()
         val tokenAccounts = mutableSetOf<TokenAccount>()
+        // mint -> (senderOwner, receiverOwner) among non-our entries, used to infer from/to
+        val mintCounterparties = mutableMapOf<String, Pair<String?, String?>>()
 
         if (meta != null) {
             val postTokenBalances = meta.postTokenBalances ?: emptyList()
@@ -239,14 +280,25 @@ class TransactionSyncer(
                 val preBalance = preByKey[key]
 
                 val owner = postBalance?.owner ?: preBalance?.owner ?: continue
-                if (owner != ourAddress) continue
-
                 val mint = postBalance?.mint ?: preBalance?.mint ?: continue
-                val decimals = postBalance?.uiTokenAmount?.decimals ?: preBalance?.uiTokenAmount?.decimals ?: 0
 
                 val postAmount = postBalance?.uiTokenAmount?.amount?.toBigDecimalOrNull() ?: BigDecimal.ZERO
                 val preAmount = preBalance?.uiTokenAmount?.amount?.toBigDecimalOrNull() ?: BigDecimal.ZERO
                 val change = postAmount - preAmount
+
+                if (owner != ourAddress) {
+                    // Track counterparty for from/to inference: who decreased = sender, who increased = receiver
+                    if (change < BigDecimal.ZERO) {
+                        val current = mintCounterparties[mint] ?: Pair(null, null)
+                        mintCounterparties[mint] = current.copy(first = owner)
+                    } else if (change > BigDecimal.ZERO) {
+                        val current = mintCounterparties[mint] ?: Pair(null, null)
+                        mintCounterparties[mint] = current.copy(second = owner)
+                    }
+                    continue
+                }
+
+                val decimals = postBalance?.uiTokenAmount?.decimals ?: preBalance?.uiTokenAmount?.decimals ?: 0
 
                 if (change.compareTo(BigDecimal.ZERO) == 0) continue
 
@@ -259,6 +311,19 @@ class TransactionSyncer(
                 val accountIndex = postBalance?.accountIndex ?: preBalance?.accountIndex ?: continue
                 if (accountIndex < accountKeys.size) {
                     tokenAccounts.add(TokenAccount(accountKeys[accountIndex], mint, BigDecimal.ZERO, decimals))
+                }
+            }
+
+            // Infer from/to for SPL-only transactions (no SOL counterparty detected)
+            if (solFrom == null && solTo == null && tokenTransfers.isNotEmpty()) {
+                val primaryTransfer = tokenTransfers.first()
+                val counterparty = mintCounterparties[primaryTransfer.tokenTransfer.mintAddress]
+                if (primaryTransfer.tokenTransfer.incoming) {
+                    solFrom = counterparty?.first
+                    solTo = ourAddress
+                } else {
+                    solFrom = ourAddress
+                    solTo = counterparty?.second
                 }
             }
         }
@@ -309,21 +374,37 @@ class TransactionSyncer(
     }
 
     private suspend fun getSignaturesFromRpcNode(lastTransactionHash: String?): List<SignatureInfo> {
+        val walletSignatures = fetchAllSignaturesForAddress(publicKey, lastTransactionHash)
+
+        val tokenAccountSignatures = mutableListOf<SignatureInfo>()
+        for (tokenAccount in storage.getTokenAccounts()) {
+            try {
+                val key = PublicKey.valueOf(tokenAccount.address)
+                tokenAccountSignatures.addAll(fetchAllSignaturesForAddress(key, lastTransactionHash))
+            } catch (e: Throwable) {
+                Log.e(TAG, "Failed to fetch signatures for token account ${tokenAccount.address}", e)
+            }
+        }
+
+        return (walletSignatures + tokenAccountSignatures)
+            .distinctBy { it.signature }
+            .sortedByDescending { it.blockTime ?: 0L }
+    }
+
+    private suspend fun fetchAllSignaturesForAddress(address: PublicKey, lastTransactionHash: String?): List<SignatureInfo> {
         val signatureObjects = mutableListOf<SignatureInfo>()
-        var signatureObjectsChunk = listOf<SignatureInfo>()
+        var chunk = listOf<SignatureInfo>()
 
         do {
-            val lastSignature = signatureObjectsChunk.lastOrNull()?.signature
-            signatureObjectsChunk = getSignaturesChunk(lastTransactionHash, lastSignature)
-            signatureObjects.addAll(signatureObjectsChunk)
-
-        } while (signatureObjectsChunk.size == rpcSignaturesCount)
+            chunk = getSignaturesChunk(address, lastTransactionHash, chunk.lastOrNull()?.signature)
+            signatureObjects.addAll(chunk)
+        } while (chunk.size == rpcSignaturesCount)
 
         return signatureObjects
     }
 
-    private suspend fun getSignaturesChunk(lastTransactionHash: String?, before: String? = null) = suspendCoroutine<List<SignatureInfo>> { continuation ->
-        rpcClient.getSignaturesForAddress(publicKey, until = lastTransactionHash, before = before, limit = rpcSignaturesCount) { result ->
+    private suspend fun getSignaturesChunk(address: PublicKey, lastTransactionHash: String?, before: String? = null) = suspendCoroutine<List<SignatureInfo>> { continuation ->
+        rpcClient.getSignaturesForAddress(address, until = lastTransactionHash, before = before, limit = rpcSignaturesCount) { result ->
             result.onSuccess { signatureObjects ->
                 continuation.resume(signatureObjects)
             }
@@ -403,6 +484,7 @@ class TransactionSyncer(
     }
 
     companion object {
+        private const val TAG = "TransactionSyncer"
         val tokenProgramId = TokenProgram.PROGRAM_ID.toBase58()
         val tokenMetadataProgramId = TokenMetadataProgram.publicKey.toBase58()
         const val rpcSignaturesCount = 1000

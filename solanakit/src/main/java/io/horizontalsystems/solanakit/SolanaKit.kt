@@ -298,7 +298,7 @@ class SolanaKit(
             walletId: String,
             debug: Boolean = false
         ): SolanaKit {
-            val httpClient = httpClient(debug)
+            val httpClient = httpClient(debug, listOfNotNull(rpcSource.createInterceptor()))
             val config = NetworkingRouterConfig(
                 listOf(MetadataAccountRule()),
                 listOf(MetadataAccountJsonAdapterFactory(), BufferInfoJsonAdapterFactory())
@@ -321,7 +321,7 @@ class SolanaKit(
             val transactionDatabase = SolanaDatabaseManager.getTransactionDatabase(application, walletId)
             val transactionStorage = TransactionStorage(transactionDatabase, addressString)
             val tokenAccountManager = TokenAccountManager(addressString, rpcApiClient, transactionStorage, mainStorage)
-            val transactionManager = TransactionManager(address, transactionStorage, rpcAction, tokenAccountManager)
+            val transactionManager = TransactionManager(address, transactionStorage, rpcAction, tokenAccountManager, rpcSource.url.toString(), httpClient)
             val pendingTransactionSyncer = PendingTransactionSyncer(rpcApiClient, transactionStorage, transactionManager)
             val transactionSyncer = TransactionSyncer(
                 address.publicKey,
@@ -346,11 +346,14 @@ class SolanaKit(
             SolanaDatabaseManager.clear(context, walletId)
         }
 
-        private fun httpClient(debug: Boolean): OkHttpClient {
+        private fun httpClient(debug: Boolean, extraInterceptors: List<okhttp3.Interceptor> = emptyList()): OkHttpClient {
             val client = OkHttpClient.Builder()
                 .hostnameVerifier(HostnameVerifier { hostname, session ->
                     return@HostnameVerifier true
                 })
+
+            extraInterceptors.forEach { client.addInterceptor(it) }
+
             if (debug) {
                 val loggingInterceptor = HttpLoggingInterceptor { message ->
                     Log.e("solana-kit", message)
