@@ -10,6 +10,7 @@ import io.horizontalsystems.solanakit.models.Transaction
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.rx2.await
+import kotlinx.coroutines.withTimeout
 import org.sol4k.RpcUrl
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -36,23 +37,7 @@ class PendingTransactionSyncer(
 
         pendingTransactions.forEach { pendingTx ->
             try {
-                    val params: MutableList<Any> = ArrayList()
-                    params.add(pendingTx.hash)
-                    rpcClient.router.request<ConfirmedTransaction>("getTransaction", params, ConfirmedTransaction::class.java) {
-                        if (it.isSuccess) {
-                            it.getOrNull()?.meta?.let { meta ->
-                                updatedTransactions.add(
-                                    pendingTx.copy(pending = false, error = meta.err?.toString())
-                                )
-                            }
-                            storage.updateTransactions(updatedTransactions)
-                            GlobalScope.launch {
-                                transactionManager.notifyTransactionsUpdate(storage.getFullTransactions(updatedTransactions.map { it.hash }))
-                            }
-                        }
-                    }
-
-                /*val confirmedTransaction = withTimeout(2000) {
+                val confirmedTransaction = withTimeout(2000) {
                     rpcClient.getConfirmedTransaction(pendingTx.hash).await()
                 }
 
@@ -60,7 +45,7 @@ class PendingTransactionSyncer(
                     updatedTransactions.add(
                         pendingTx.copy(pending = false, error = meta.err?.toString())
                     )
-                }*/
+                }
 
             } catch (error: Throwable) {
                 if (currentBlockHeight <= pendingTx.lastValidBlockHeight) {
