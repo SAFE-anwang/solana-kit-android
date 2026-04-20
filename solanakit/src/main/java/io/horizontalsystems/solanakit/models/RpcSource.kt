@@ -12,6 +12,18 @@ sealed class RpcSource(var name: String, var endpoint: RPCEndpoint, val syncInte
 
     abstract fun createInterceptor(): Interceptor?
 
+    object Serum: RpcSource("Serum Project API", RPCEndpoint.mainnetBetaSerum, 30) {
+        override fun createInterceptor(): Interceptor? {
+            return null
+        }
+    }
+
+    object TritonOne: RpcSource("TritonOne API", RPCEndpoint.mainnetBetaSolana, 30) {
+        override fun createInterceptor(): Interceptor? {
+            return null
+        }
+    }
+
     class Alchemy(apiKeys: String) : RpcSource(
         "Alchemy",
         buildEndpoint(apiKeys),
